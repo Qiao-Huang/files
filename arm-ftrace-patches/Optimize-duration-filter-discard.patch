@@ -1,0 +1,95 @@
+Add a routine to allow optimizing the removal of the last
+committed entry in the trace log.  This is useful for
+function duration tracing, and can greatly expand the
+time coverage of a trace, by reclaiming almost all space
+for filtered function events.
+
+Signed-off-by: Tim Bird <tim.bird@am.sony.com>
+---
+ include/linux/ring_buffer.h |    8 +++++++
+ kernel/trace/ring_buffer.c  |   45 ++++++++++++++++++++++++++++++++++++++++++++
+ kernel/trace/trace.c        |    2 -
+ 3 files changed, 54 insertions(+), 1 deletion(-)
+
+--- a/include/linux/ring_buffer.h
++++ b/include/linux/ring_buffer.h
+@@ -106,6 +106,14 @@ void ring_buffer_discard_commit(struct r
+ 				struct ring_buffer_event *event);
+ 
+ /*
++ * ring_buffer_rewind_tail will remove an event that has already
++ *   been committed.  It remains to be determined if it is safe to
++ *   do this.
++ */
++void ring_buffer_rewind_tail(struct ring_buffer *buffer,
++				struct ring_buffer_event *event);
++
++/*
+  * size is in bytes for each per CPU buffer.
+  */
+ struct ring_buffer *
+--- a/kernel/trace/ring_buffer.c
++++ b/kernel/trace/ring_buffer.c
+@@ -1801,6 +1801,51 @@ void ring_buffer_discard_commit(struct r
+ EXPORT_SYMBOL_GPL(ring_buffer_discard_commit);
+ 
+ /**
++ * ring_buffer_rewind_tail - discard an event that was previously committed
++ * @buffer: the ring buffer
++ * @event: committed event to discard
++ *
++ * This is similar to ring_buffer_discard_commit but is intended to be
++ * performed on an event that has already been committed.
++ * This routine will try to free the event from the ring buffer.
++ *
++ * If there is some problem, the event is discarded, but not freed.
++ */
++void ring_buffer_rewind_tail(struct ring_buffer *buffer,
++				struct ring_buffer_event *event)
++{
++	struct ring_buffer_per_cpu *cpu_buffer;
++	int cpu;
++
++	/* The event is discarded regardless */
++	rb_event_discard(event);
++
++	cpu = smp_processor_id();
++	cpu_buffer = buffer->buffers[cpu];
++
++	/*
++	 * If this is the last event in the buffer,
++	 * this should work...
++	 */
++	if (likely(rb_try_to_discard(cpu_buffer, event))) {
++		/* FIXTHIS - possibility for a race with a reader here? */
++
++		/* reduce the count of entries in the buffer */
++		local_dec(&cpu_buffer->entries);
++
++		/* FIXTHIS - possibility for a race with a writer here? */
++		rb_set_commit_to_write(cpu_buffer);
++
++		/*
++		 * if a write comes in, between the try_to_discard() and
++		 * the set_commit_to_write(), but was not committed yet,
++		 * we just committed it.  This should be rare.
++		 */
++	}
++}
++EXPORT_SYMBOL_GPL(ring_buffer_rewind_tail);
++
++/**
+  * ring_buffer_write - write data to the buffer without reserving
+  * @buffer: The ring buffer to write to.
+  * @length: The length of the data being written (excluding the event header)
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@ -999,7 +999,7 @@ static void trace_buffer_discard_func_en
+ 
+ 	prev_entry = ring_buffer_event_data(prev_event);
+ 	if (func == prev_entry->graph_ent.func) {
+-		ring_buffer_event_discard(prev_event);
++		ring_buffer_rewind_tail(global_trace.buffer, prev_event);
+ 	}
+ }
+ 
